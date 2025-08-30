@@ -302,3 +302,277 @@ def backfill_senti_psaw(
     # Drop timezone (simulate() expects naive dates)
     df.index = df.index.tz_localize(None)
     return df
+
+import math
+import numpy as np
+import pandas as pd
+from datetime import datetime
+import yfinance as yf
+from .consultant import _decide_row_from_feats, _score_sentiment # Import necessary functions from consultant.py
+
+
+# =========================
+# Helpers to normalize yfinance frames
+# =========================
+
+
+_FIELD_NAMES = {"Open","High","Low","Close","Adj Close","Volume"}
+
+def _normalize_yf(px: pd.DataFrame, ticker: str | None = None) -> pd.DataFrame:
+    """
+    Normalize yfinance DataFrame to:
+      - Single-level DatetimeIndex
+      - Columns: Open, High, Low, Close, Volume (Close falls back to Adj Close if needed)
+    Handles:
+      * Single-level columns already fine
+      * MultiIndex with (ticker, field)
+      * MultiIndex with (field, ticker)
+    """
+    df = px.copy()
+
+    # 1) Ensure DatetimeIndex (take first level if MultiIndex index)
+    if isinstance(df.index, pd.MultiIndex):
+        df.index = pd.to_datetime(df.index.get_level_values(0))
+    else:
+        df.index = pd.to_datetime(df.index)
+    df.sort_index(inplace=True)
+
+    # 2) Flatten/standardize columns
+    if isinstance(df.columns, pd.MultiIndex):
+        # find which level holds field names
+        lvl_with_fields = None
+        for lvl in range(df.columns.nlevels):
+            vals = set(map(str, df.columns.get_level_values(lvl)))
+            if _FIELD_NAMES & vals:
+                lvl_with_fields = lvl
+                break
+
+        if lvl_with_fields is not None:
+            # Build a new frame by selecting each field across that level
+            parts = {}
+            for f in ["Open","High","Low","Close","Adj Close","Volume"]:
+                if f in set(map(str, df.columns.get_level_values(lvl_with_fields))):
+                    try:
+                        sel = df.xs(f, axis=1, level=lvl_with_fields)
+                        # If xs returns a Series for some reason, make it a 1-col DF
+                        if isinstance(sel, pd.Series):
+                            sel = sel.to_frame(f)
+                        # If there are multiple tickers, pick the first column
+                        if isinstance(sel.columns, pd.MultiIndex):
+                            # flatten again if weird
+                            sel.columns = [c[-1] for c in sel.columns]
+                        if sel.shape[1] > 1:
+                            # prefer the requested ticker if present
+                            if ticker and ticker in sel.columns:
+                                parts[f] = sel[ticker]
+                            else:
+                                parts[f] = sel.iloc[:, 0]
+                        else:
+                            parts[f] = sel.iloc[:, 0]
+                    except Exception:
+                        pass
+            df = pd.DataFrame(parts, index=df.index)
+        else:
+            # No level clearly contains field names -> flatten by last level
+            df.columns = [str(c[-1]) for c in df.columns]
+
+    # 3) Standardize column names (case-insensitive)
+    lower_map = {c: str(c).strip().lower().replace(" ", "") for c in df.columns}
+    df = df.rename(columns=lower_map)
+
+    # 4) Create canonical frame
+    out = pd.DataFrame(index=df.index)
+    def pick(*names):
+        for n in names:
+            if n in df.columns:
+                return df[n]
+        return pd.Series(np.nan, index=df.index)
+
+    out["Open"]   = pick("open")
+    out["High"]   = pick("high")
+    out["Low"]    = pick("low")
+    # prefer close; fall back to adjclose
+    close_series  = pick("close")
+    if close_series.isna().all():
+        close_series = pick("adjclose","adjustedclose","adjustclose")
+    out["Close"]  = close_series
+    out["Volume"] = pick("volume")
+
+    # 5) Validate & drop rows with any missing
+    missing_all = [c for c in ["Open","High","Low","Close","Volume"] if out[c].isna().all()]
+    if missing_all:
+        raise RuntimeError(
+            f"Missing required price columns after normalization: {missing_all}. "
+            f"Raw columns: {list(px.columns)}"
+        )
+
+    out = out.dropna(how="any")
+    return out
+
+# =========================
+# Feature engineering
+# =========================
+
+def _compute_rsi_series(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    ups = delta.clip(lower=0)
+    downs = -delta.clip(upper=0)
+    roll_up = ups.ewm(alpha=1/period, adjust=False).mean()
+    roll_down = downs.ewm(alpha=1/period, adjust=False).mean()
+    rs = roll_up / roll_down.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def _build_features_historical(px: pd.DataFrame) -> pd.DataFrame:
+    """Build features as-of t-1 close, to decide at day t open."""
+    close = px["Close"]
+    feats = pd.DataFrame(index=px.index)
+    feats["r1"] = (close / close.shift(1) - 1).shift(1)
+    feats["r5"] = (close / close.shift(5) - 1).shift(1)
+    feats["rsi14"] = _compute_rsi_series(close, 14).shift(1)
+    return feats
+
+# =========================
+# Core backtest (single ticker)
+# =========================
+
+def simulate(
+    ticker: str,
+    start: str = "2019-01-01",
+    end: str | None = None,
+    fraction_per_trade: float = 0.10,
+    cost_bps: float = 5.0,
+    initial_cash: float = 100_000.0,
+    allow_short: bool = True,
+    senti_daily: pd.DataFrame | None = None,
+):
+    """
+    Backtest one ticker with your decision rules.
+    - Decide at day t open using features through t-1 close
+    - Trade to a target exposure of ±fraction_per_trade * equity at the OPEN
+    - Mark P&L at the CLOSE
+    - cost_bps applied per side on traded notional
+    - senti_daily (optional): index=Date, columns ['senti_mean','senti_pos_share','senti_count'].
+      It is shifted by 1 day internally to avoid look-ahead.
+
+    Returns: (summary: dict, ledger: pd.DataFrame)
+    """
+    end = end or datetime.now().strftime("%Y-%m-%d")
+    # Explicitly set auto_adjust=False and group_by='column' to avoid surprises
+    px = yf.download(ticker, start=start, end=end, interval="1d", progress=False, auto_adjust=False, group_by='column')
+    if px.empty:
+        raise RuntimeError(f"No price data for {ticker} in range {start}..{end}")
+    px = _normalize_yf(px, ticker)
+
+    feats = _build_features_historical(px)
+
+    if senti_daily is not None:
+        sd = senti_daily.copy()
+        # normalize index
+        if isinstance(sd.index, pd.MultiIndex):
+            sd.index = pd.to_datetime(sd.index.get_level_values(0))
+        else:
+            sd.index = pd.to_datetime(sd.index)
+        sd = sd.sort_index()
+        # Ensure expected columns
+        for c in ["senti_mean","senti_pos_share","senti_count"]:
+            if c not in sd.columns:
+                sd[c] = np.nan
+        # Only data up to t-1 can be used at t
+        feats = feats.join(sd[["senti_mean","senti_pos_share","senti_count"]].shift(1), how="left")
+
+    df = px.join(feats, how="left")
+
+    cash = initial_cash
+    shares = 0.0
+    prev_equity = initial_cash
+    rows = []
+
+    for dt, row in df.iterrows():
+        open_p  = float(row["Open"])
+        close_p = float(row["Close"])
+
+        # Decide at today's OPEN
+        action = _decide_row_from_feats(row)
+
+        # Compute target shares
+        equity_mark = cash + shares * close_p
+        target_shares = shares
+        if action == "buy":
+            target_val = fraction_per_trade * equity_mark
+            target_shares = math.floor(target_val / open_p)
+        elif action == "short" and allow_short:
+            target_val = -fraction_per_trade * equity_mark
+            target_shares = -math.floor(abs(target_val) / open_p)
+
+        # Execute once at OPEN
+        delta = target_shares - shares
+        if delta != 0:
+            fees = abs(delta) * open_p * (cost_bps / 10_000.0)
+            cash -= delta * open_p
+            cash -= fees
+            shares = target_shares
+
+        # Mark at CLOSE
+        equity = cash + shares * close_p
+        daily_ret = (equity / prev_equity - 1.0) if prev_equity > 0 else 0.0
+        rows.append({
+            "date": dt, "action": action, "open": open_p, "close": close_p,
+            "shares": shares, "cash": cash, "equity": equity, "ret": daily_ret
+        })
+        prev_equity = equity
+
+    ledger = pd.DataFrame(rows).set_index("date")
+    daily = ledger["ret"].fillna(0.0)
+    ann = 252.0
+    total_ret = ledger["equity"].iloc[-1] / initial_cash - 1.0
+    cagr = (1 + total_ret) ** (ann / max(1, len(daily))) - 1.0
+    sharpe = (daily.mean() / (daily.std() + 1e-12)) * np.sqrt(ann) if daily.std() > 0 else np.nan
+
+    # Max drawdown
+    peaks = ledger["equity"].cummax()
+    dd = ledger["equity"] / peaks - 1.0
+    mdd = dd.min()
+    mdd_end = dd.idxmin()
+    mdd_start = ledger["equity"].loc[:mdd_end].idxmax()
+
+    summary = {
+        "ticker": ticker,
+        "final_equity": float(ledger["equity"].iloc[-1]),
+        "total_return": float(total_ret),
+        "CAGR": float(cagr),
+        "Sharpe": float(sharpe),
+        "MaxDrawdown": float(mdd),
+        "MDD_start": mdd_start,
+        "MDD_end": mdd_end,
+        "trading_days": int(len(ledger)),
+        "fraction_per_trade": fraction_per_trade,
+        "cost_bps": cost_bps,
+    }
+    return summary, ledger
+
+# Convenience runner
+
+def simulate_and_show(ticker="NVDA", start="2019-01-01"):
+    s, ledg = simulate(ticker, start=start)
+    print("Summary:", {k: (round(v,4) if isinstance(v, float) else v) for k,v in s.items()})
+    display(ledg.tail(10))
+    return s, ledg
+
+def run_demo(ticker="NVDA", start="2019-01-01"):
+    """
+    Runs a demo of the stock consultant and backtesting for a given ticker.
+    """
+    print(f"--- Running Demo for {ticker.upper()} ---")
+
+    # Consult
+    decision, explanation = consult(ticker, explain=True)
+    print("\nConsult Decision:", decision)
+    print("Consult Features:", explanation["features"])
+    print("Consult Rationale:", explanation["rationale"])
+
+    # Simulate
+    print(f"\n--- Running Simulation for {ticker.upper()} from {start} ---")
+    simulate_and_show(ticker, start=start)
+
+    print(f"\n--- Demo for {ticker.upper()} Complete ---")
